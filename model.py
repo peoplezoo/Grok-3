@@ -1215,184 +1215,371 @@ class LanguageModel(hk.Module):
         *,
         batch: Dict[str, jax.Array] = {},
         last_hid_only: bool = False,
-        length: Optional[jax.Array] = None,
-    ) -> LanguageModelOutput:
-        """Forward pass, producing a sequence of logits."""
-        del batch  # Unused.
+import jax
+import jax.numpy as jnp
+import torch
+import torch.nn as nn
+from dataclasses import dataclass
+from typing import Optional, Tuple, Dict, Any, NamedTuple, Union
+import functools
 
-        config = self.config
-
-        input_mask = jnp.greater(tokens, config.pad_token)
-
-        # Embed the input tokens and positions.
-        in_out_embed = InOutEmbed(
-            self.config.vocab_size,
-            embed_dim=self.config.model_size,
-            sharding=P(None, ("data", "model")),
-        )
-        input_embeddings = in_out_embed(tokens).astype(config.fprop_dtype)
-        input_embeddings = with_sharding_constraint(
-            input_embeddings, P("data", None, self.model.model_axis)
-        )
-        input_embeddings *= config.embedding_multiplier_scale
-
-        model_output = self.model(
-            input_embeddings,
-            input_mask,
-            memory=memory,
-        )  # [B, T, D]
-        embeddings, model_state = model_output.embeddings, model_output.memory
-        if self.model.shard_activations:
-            embeddings = with_sharding_constraint(
-                embeddings, P("data", None, self.model.model_axis)
-            )
-        else:
-            embeddings = with_sharding_constraint(embeddings, P("data", None))
-        rank_logger.debug(f"Final embedding shape: {embeddings.shape}")
-        embeddings = layer_norm(embeddings, self.model)
-        assert embeddings.dtype == self.fprop_dtype
-
-        if last_hid_only:
-            last_step = jnp.maximum(jnp.sum(input_mask.astype(jnp.int32), axis=1) - 1, 0)
-            last_hid = jax.vmap(lambda x, i: x[i], in_axes=0, out_axes=0)(embeddings, last_step)
-            return last_hid
-
-        if length is not None:
-            last_step = jnp.maximum(length.astype(jnp.int32) - 1, 0)
-            embeddings = jax.vmap(lambda x, i: x[i], in_axes=0, out_axes=0)(embeddings, last_step)
-            embeddings = jnp.expand_dims(embeddings, axis=1)
-
-        # Decode the embeddings (here, we use tied weights).
-        rank_logger.info(embeddings.shape)
-        out = in_out_embed.decode(embeddings)
-        rank_logger.info(out.shape)
-        out *= config.output_multiplier_scale
-
-        if self.model.shard_activations:
-            out = with_sharding_constraint(out, P("data", None, self.model.model_axis))
-        else:
-            out = with_sharding_constraint(out, P("data", None))
-
-        return LanguageModelOutput(
-            logits=out,
-            model_state=model_state,
-        )
-
-    def init_memory(self, batch_size: int, seq_len: int, dtype=jnp.bfloat16):
-        return self.model.init_memory(batch_size=batch_size, sequence_len=seq_len, dtype=dtype)
-
-    def prefill_memory(self, prompts, memory):
-        # Pad to the left and right align?
-        # Basically assume prompt is already padded
-        model_output = self(prompts, memory=memory)
-        return model_output.logits, model_output.model_state
-
-
+# Common configurations and utilities that work across both implementations
 @dataclass
-class Transformer(hk.Module):
-    """A transformer stack."""
+class SharedConfig:
+    vocab_size: int = 1000
+    embed_dim: int = 256
+    num_heads: int = 8
+    num_kv_heads: int = 4
+    key_size: int = 32
+    num_layers: int = 6
+    sequence_len: int = 50
 
-    num_q_heads: int
-    num_kv_heads: int
-    key_size: int
-    widening_factor: float
-    init_scale: float
-    mesh: Any
-    attn_output_multiplier: float
-    shard_activations: bool
-    num_layers: int
-    # MoE
-    num_experts: int
-    num_selected_experts: int
-    name: Optional[str] = None
+def convert_jax_to_torch(params):
+    """Convert JAX parameters to PyTorch parameters"""
+    if isinstance(params, dict):
+        return {k: convert_jax_to_torch(v) for k, v in params.items()}
+    elif isinstance(params, jnp.ndarray):
+        return torch.from_numpy(np.array(params))
+    else:
+        return params
 
-    # Used for activation sharding
-    data_axis: Union[str, Tuple[str, ...]] = "data"
-    model_axis: Union[str, Tuple[str, ...]] = "model"
+def convert_torch_to_jax(params):
+    """Convert PyTorch parameters to JAX parameters"""
+    if isinstance(params, dict):
+        return {k: convert_torch_to_jax(v) for k, v in params.items()}
+    elif isinstance(params, torch.Tensor):
+        return jnp.array(params.detach().cpu().numpy())
+    else:
+        return params
 
-    def init_memory(self, batch_size: int, sequence_len: int, dtype=jnp.bfloat16):
-        return Memory(
-            layers=init_layer_memories(
-                batch_size,
-                sequence_len,
-                self.num_kv_heads,
-                self.key_size,
-                self.num_layers,
-                step=jnp.zeros(batch_size, dtype=jnp.int32),
-                dtype=dtype,
-            ),
+class CombinedTransformer:
+    """Wrapper class that combines both JAX and PyTorch implementations"""
+    
+    def __init__(self, config: SharedConfig):
+        self.config = config
+        
+        # Initialize JAX model
+        self.jax_model = TransformerJAX(
+            num_q_heads=config.num_heads,
+            num_kv_heads=config.num_kv_heads,
+            key_size=config.key_size,
+            vocab_size=config.vocab_size,
+            embed_dim=config.embed_dim,
+            num_layers=config.num_layers
         )
-
-    def __call__(
-        self,
-        embeddings: jax.Array,  # [B, T, D]
-        mask: jax.Array,  # [B, T]
-        memory: Optional[Memory],
-    ) -> TransformerOutput:
-        """Transforms input embedding sequences to output embedding sequences."""
-
-        fprop_dtype = embeddings.dtype
-        _, seq_len, model_size = embeddings.shape
-        padding_mask = mask.copy()
-        mask = mask[:, None, None, :]  # [B, H=1, T'=1, T]
-
-        # Compute causal mask for autoregressive sequence modelling.
-        causal_mask = jnp.tril(jnp.ones((1, 1, seq_len, seq_len))).astype(
-            fprop_dtype
-        )  # [B=1, H=1, T, T]
-        mask = mask * causal_mask  # [B, H=1, T, T]
-
-        h = embeddings
-        kv_memories = []
-
-        def block(
-            h,
-            mask,
-            padding_mask,
-            memory,
-            layer_index: Optional[int] = None,
-            widening_factor: Optional[int] = None,
-            name: Optional[str] = None,
-        ) -> DecoderOutput:
-            return DecoderLayer(
-                num_q_heads=self.num_q_heads,
-                num_kv_heads=self.num_kv_heads,
-                key_size=self.key_size,
-                widening_factor=widening_factor or self.widening_factor,
-                num_layers=self.num_layers,
-                mesh=self.mesh,
-                data_axis=self.data_axis,
-                model_axis=self.model_axis,
-                attn_output_multiplier=self.attn_output_multiplier,
-                shard_activations=self.shard_activations,
-                # MoE.
-                num_experts=self.num_experts,
-                num_selected_experts=self.num_selected_experts,
-                name=name,
-                layer_index=layer_index,
-            )(
-                h,
-                mask,
-                padding_mask,
-                memory,
-            )
-
-        for i in range(self.num_layers):
-            decoder_output = block(
-                h,
-                mask,
-                padding_mask,
-                memory.layers[i] if memory else None,
-                layer_index=i,
-                name=f"decoder_layer_{i}",
-            )
-            h, new_kv_memory = (
-                decoder_output.embeddings,
-                decoder_output.memory,
-            )
-            kv_memories.append(new_kv_memory)
-
-        return TransformerOutput(
-            embeddings=h,
-            memory=Memory(layers=kv_memories),
+        
+        # Initialize PyTorch model
+        self.torch_model = TransformerPyTorch(
+            vocab_size=config.vocab_size,
+            embed_dim=config.embed_dim,
+            num_heads=config.num_heads,
+            num_kv_heads=config.num_kv_heads,
+            key_size=config.key_size,
+            num_layers=config.num_layers
         )
+        
+        # Initialize domain decomposer
+        self.domain_decomposer = DomainDecomposer()
+
+    def forward_jax(self, x):
+        """Forward pass using JAX implementation"""
+        return self.jax_model(x)
+    
+    def forward_torch(self, x):
+        """Forward pass using PyTorch implementation"""
+        return self.torch_model(x)
+    
+    def forward_combined(self, x_jax, x_torch):
+        """Combined forward pass using both implementations"""
+        # Get domain assignments from PyTorch model
+        domains = self.domain_decomposer.split_domain(x_torch)
+        
+        # Process through JAX model
+        jax_output = self.forward_jax(x_jax)
+        
+        # Convert JAX output to PyTorch
+        jax_output_torch = torch.from_numpy(np.array(jax_output))
+        
+        # Process through PyTorch model with domain awareness
+        torch_output = self.forward_torch(x_torch)
+        
+        # Combine outputs based on domain assignments
+        combined_output = torch_output.clone()
+        for domain_idx in range(self.domain_decomposer.num_domains):
+            domain_mask = (domains == domain_idx)
+            combined_output[domain_mask] = (
+                0.5 * torch_output[domain_mask] + 
+                0.5 * jax_output_torch[domain_mask]
+import jax
+import jax.numpy as jnp
+import torch
+import torch.nn as nn
+from dataclasses import dataclass
+from typing import Optional, Tuple, Dict, Any, NamedTuple, Union
+import functools
+
+# Common configurations and utilities that work across both implementations
+@dataclass
+class SharedConfig:
+    vocab_size: int = 1000
+    embed_dim: int = 256
+    num_heads: int = 8
+    num_kv_heads: int = 4
+    key_size: int = 32
+    num_layers: int = 6
+    sequence_len: int = 50
+
+def convert_jax_to_torch(params):
+    """Convert JAX parameters to PyTorch parameters"""
+    if isinstance(params, dict):
+        return {k: convert_jax_to_torch(v) for k, v in params.items()}
+    elif isinstance(params, jnp.ndarray):
+        return torch.from_numpy(np.array(params))
+    else:
+        return params
+
+def convert_torch_to_jax(params):
+    """Convert PyTorch parameters to JAX parameters"""
+    if isinstance(params, dict):
+        return {k: convert_torch_to_jax(v) for k, v in params.items()}
+    elif isinstance(params, torch.Tensor):
+        return jnp.array(params.detach().cpu().numpy())
+    else:
+        return params
+
+class CombinedTransformer:
+    """Wrapper class that combines both JAX and PyTorch implementations"""
+    
+    def __init__(self, config: SharedConfig):
+        self.config = config
+        
+        # Initialize JAX model
+        self.jax_model = TransformerJAX(
+            num_q_heads=config.num_heads,
+            num_kv_heads=config.num_kv_heads,
+            key_size=config.key_size,
+            vocab_size=config.vocab_size,
+            embed_dim=config.embed_dim,
+            num_layers=config.num_layers
+        )
+        
+        # Initialize PyTorch model
+        self.torch_model = TransformerPyTorch(
+            vocab_size=config.vocab_size,
+            embed_dim=config.embed_dim,
+            num_heads=config.num_heads,
+            num_kv_heads=config.num_kv_heads,
+            key_size=config.key_size,
+            num_layers=config.num_layers
+        )
+        
+        # Initialize domain decomposer
+        self.domain_decomposer = DomainDecomposer()
+
+    def forward_jax(self, x):
+        """Forward pass using JAX implementation"""
+        return self.jax_model(x)
+    
+    def forward_torch(self, x):
+        """Forward pass using PyTorch implementation"""
+        return self.torch_model(x)
+    
+    def forward_combined(self, x_jax, x_torch):
+        """Combined forward pass using both implementations"""
+        # Get domain assignments from PyTorch model
+        domains = self.domain_decomposer.split_domain(x_torch)
+        
+        # Process through JAX model
+        jax_output = self.forward_jax(x_jax)
+        
+        # Convert JAX output to PyTorch
+        jax_output_torch = torch.from_numpy(np.array(jax_output))
+        
+        # Process through PyTorch model with domain awareness
+        torch_output = self.forward_torch(x_torch)
+        
+        # Combine outputs based on domain assignments
+        combined_output = torch_output.clone()
+        for domain_idx in range(self.domain_decomposer.num_domains):
+            domain_mask = (domains == domain_idx)
+            combined_output[domain_mask] = (
+                0.5 * torch_output[domain_mask] + 
+                0.5 * jax_output_torch[domain_mask]
+            )
+        
+        return combined_output
+
+class TransformerJAX:
+    """JAX-based transformer implementation"""
+    
+    def __init__(self, num_q_heads, num_kv_heads, key_size, vocab_size, embed_dim, num_layers):
+        self.num_q_heads = num_q_heads
+        self.num_kv_heads = num_kv_heads
+        self.key_size = key_size
+        self.vocab_size = vocab_size
+        self.embed_dim = embed_dim
+        self.num_layers = num_layers
+        
+        # Initialize parameters using JAX
+        self.params = self.init_params()
+    
+    def init_params(self):
+        # Initialize transformer parameters
+        key = jax.random.PRNGKey(0)
+        return {
+            'embedding': jax.random.normal(key, (self.vocab_size, self.embed_dim)),
+            'layers': [
+                {
+                    'attention': {
+                        'query': jax.random.normal(key, (self.embed_dim, self.num_q_heads * self.key_size)),
+                        'key': jax.random.normal(key, (self.embed_dim, self.num_kv_heads * self.key_size)),
+                        'value': jax.random.normal(key, (self.embed_dim, self.num_kv_heads * self.key_size))
+                    },
+                    'ffn': {
+                        'w1': jax.random.normal(key, (self.embed_dim, 4 * self.embed_dim)),
+                        'w2': jax.random.normal(key, (4 * self.embed_dim, self.embed_dim))
+                    }
+                }
+                for _ in range(self.num_layers)
+            ]
+        }
+    
+    def __call__(self, x):
+        return self.forward(x)
+    
+    def forward(self, x):
+        # JAX forward implementation
+        # (simplified for demonstration)
+        h = jnp.take(self.params['embedding'], x, axis=0)
+        
+        for layer in self.params['layers']:
+            # Self-attention
+            q = jnp.dot(h, layer['attention']['query'])
+            k = jnp.dot(h, layer['attention']['key'])
+            v = jnp.dot(h, layer['attention']['value'])
+            
+            # Attention scores and context
+            scores = jnp.einsum('bthd,bkhd->bhtk', q, k)
+            scores = scores / jnp.sqrt(self.key_size)
+            attn = jax.nn.softmax(scores, axis=-1)
+            context = jnp.einsum('bhtk,bkhd->bthd', attn, v)
+            
+            # Feed-forward network
+            h = h + context
+            h = h + jnp.dot(jnp.maximum(0, jnp.dot(h, layer['ffn']['w1'])), layer['ffn']['w2'])
+        
+        return h
+
+class TransformerPyTorch(nn.Module):
+    """PyTorch-based transformer implementation"""
+    
+    def __init__(self, vocab_size, embed_dim, num_heads, num_kv_heads, key_size, num_layers):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, embed_dim)
+        
+        self.layers = nn.ModuleList([
+            TransformerLayerPyTorch(
+                embed_dim=embed_dim,
+                num_heads=num_heads,
+                num_kv_heads=num_kv_heads,
+                key_size=key_size
+            )
+            for _ in range(num_layers)
+        ])
+        
+    def forward(self, x):
+        h = self.embedding(x)
+        
+        for layer in self.layers:
+            h = layer(h)
+            
+        return h
+
+class TransformerLayerPyTorch(nn.Module):
+    """PyTorch transformer layer implementation"""
+    
+    def __init__(self, embed_dim, num_heads, num_kv_heads, key_size):
+        super().__init__()
+        self.self_attn = MultiHeadAttention(
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
+            key_size=key_size
+        )
+        self.ffn = nn.Sequential(
+            nn.Linear(embed_dim, 4 * embed_dim),
+            nn.ReLU(),
+            nn.Linear(4 * embed_dim, embed_dim)
+        )
+        
+    def forward(self, x):
+        h = x + self.self_attn(x)
+        h = h + self.ffn(h)
+        return h
+
+class MultiHeadAttention(nn.Module):
+    """PyTorch multi-head attention implementation"""
+    
+    def __init__(self, embed_dim, num_heads, num_kv_heads, key_size):
+        super().__init__()
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.key_size = key_size
+        
+        self.q_proj = nn.Linear(embed_dim, num_heads * key_size)
+        self.k_proj = nn.Linear(embed_dim, num_kv_heads * key_size)
+        self.v_proj = nn.Linear(embed_dim, num_kv_heads * key_size)
+        self.out_proj = nn.Linear(num_heads * key_size, embed_dim)
+        
+    def forward(self, x):
+        batch_size, seq_len, _ = x.shape
+        
+        # Project queries, keys, and values
+        q = self.q_proj(x).view(batch_size, seq_len, self.num_heads, self.key_size)
+        k = self.k_proj(x).view(batch_size, seq_len, self.num_kv_heads, self.key_size)
+        v = self.v_proj(x).view(batch_size, seq_len, self.num_kv_heads, self.key_size)
+        
+        # Compute attention scores
+        scores = torch.einsum('bthd,bkhd->bhtk', q, k)
+        scores = scores / (self.key_size ** 0.5)
+        attn = torch.softmax(scores, dim=-1)
+        
+        # Compute context
+        context = torch.einsum('bhtk,bkhd->bthd', attn, v)
+        context = context.reshape(batch_size, seq_len, -1)
+        
+        return self.out_proj(context)
+
+class DomainDecomposer:
+    """Domain decomposition for multi-scale processing"""
+    
+    def __init__(self, num_domains=4):
+        self.num_domains = num_domains
+    
+    def split_domain(self, x):
+        # Simple domain splitting based on content
+        # In practice, this would use more sophisticated clustering
+        batch_size, seq_len = x.shape
+        domains = torch.zeros((batch_size, seq_len), dtype=torch.long)
+        
+        # Assign domains based on token values
+        domains = x % self.num_domains
+        return domains
+
+def main():
+    # Configuration
+    config = SharedConfig()
+    
+    # Initialize combined model
+    model = CombinedTransformer(config)
+    
+    # Generate dummy data
+    x_torch = torch.randint(0, config.vocab_size, (16, config.sequence_len))
+    x_jax = jnp.array(x_torch.numpy())
+    
+    # Forward pass through combined model
+    output = model.forward_combined(x_jax, x_torch)
+    print(f"Combined output shape: {output.shape}")
+
+if __name__ == "__main__":
+    main()
